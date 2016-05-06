@@ -77,126 +77,131 @@ def main(args):
         # Get the paths for the corresponding images
         lfw_paths, actual_issame = lfw.get_paths(os.path.expanduser(args.lfw_dir), pairs)
         
-    
-    with tf.Graph().as_default():
-        tf.set_random_seed(args.seed)
-        global_step = tf.Variable(0, trainable=False)
+    tpu_address = 'grpc://' + os.environ['COLAB_TPU_ADDR']
+    resolver = tf.contrib.cluster_resolver.TPUClusterResolver(tpu_address)
+    tf.contrib.distribute.initialize_tpu_system(resolver)
+    strategy = tf.contrib.distribute.TPUStrategy(resolver)
 
-        # Placeholder for the learning rate
-        learning_rate_placeholder = tf.placeholder(tf.float32, name='learning_rate')
+    with strategy.scope():
+        with tf.Graph().as_default():
+            tf.set_random_seed(args.seed)
+            global_step = tf.Variable(0, trainable=False)
+
+            # Placeholder for the learning rate
+            learning_rate_placeholder = tf.placeholder(tf.float32, name='learning_rate')
+            
+            batch_size_placeholder = tf.placeholder(tf.int32, name='batch_size')
+            
+            phase_train_placeholder = tf.placeholder(tf.bool, name='phase_train')
+            
+            image_paths_placeholder = tf.placeholder(tf.string, shape=(None,3), name='image_paths')
+            labels_placeholder = tf.placeholder(tf.int64, shape=(None,3), name='labels')
+            
+            input_queue = data_flow_ops.FIFOQueue(capacity=100000,
+                                        dtypes=[tf.string, tf.int64],
+                                        shapes=[(3,), (3,)],
+                                        shared_name=None, name=None)
+            enqueue_op = input_queue.enqueue_many([image_paths_placeholder, labels_placeholder])
+            
+            nrof_preprocess_threads = 4
+            images_and_labels = []
+            for _ in range(nrof_preprocess_threads):
+                filenames, label = input_queue.dequeue()
+                images = []
+                for filename in tf.unstack(filenames):
+                    file_contents = tf.read_file(filename)
+                    image = tf.image.decode_image(file_contents, channels=3)
+                    
+                    if args.random_crop:
+                        image = tf.random_crop(image, [args.image_size, args.image_size, 3])
+                    else:
+                        image = tf.image.resize_image_with_crop_or_pad(image, args.image_size, args.image_size)
+                    if args.random_flip:
+                        image = tf.image.random_flip_left_right(image)
         
-        batch_size_placeholder = tf.placeholder(tf.int32, name='batch_size')
+                    #pylint: disable=no-member
+                    image.set_shape((args.image_size, args.image_size, 3))
+                    images.append(tf.image.per_image_standardization(image))
+                images_and_labels.append([images, label])
         
-        phase_train_placeholder = tf.placeholder(tf.bool, name='phase_train')
-        
-        image_paths_placeholder = tf.placeholder(tf.string, shape=(None,3), name='image_paths')
-        labels_placeholder = tf.placeholder(tf.int64, shape=(None,3), name='labels')
-        
-        input_queue = data_flow_ops.FIFOQueue(capacity=100000,
-                                    dtypes=[tf.string, tf.int64],
-                                    shapes=[(3,), (3,)],
-                                    shared_name=None, name=None)
-        enqueue_op = input_queue.enqueue_many([image_paths_placeholder, labels_placeholder])
-        
-        nrof_preprocess_threads = 4
-        images_and_labels = []
-        for _ in range(nrof_preprocess_threads):
-            filenames, label = input_queue.dequeue()
-            images = []
-            for filename in tf.unstack(filenames):
-                file_contents = tf.read_file(filename)
-                image = tf.image.decode_image(file_contents, channels=3)
-                
-                if args.random_crop:
-                    image = tf.random_crop(image, [args.image_size, args.image_size, 3])
-                else:
-                    image = tf.image.resize_image_with_crop_or_pad(image, args.image_size, args.image_size)
-                if args.random_flip:
-                    image = tf.image.random_flip_left_right(image)
-    
-                #pylint: disable=no-member
-                image.set_shape((args.image_size, args.image_size, 3))
-                images.append(tf.image.per_image_standardization(image))
-            images_and_labels.append([images, label])
-    
-        image_batch, labels_batch = tf.train.batch_join(
-            images_and_labels, batch_size=batch_size_placeholder, 
-            shapes=[(args.image_size, args.image_size, 3), ()], enqueue_many=True,
-            capacity=4 * nrof_preprocess_threads * args.batch_size,
-            allow_smaller_final_batch=True)
-        image_batch = tf.identity(image_batch, 'image_batch')
-        image_batch = tf.identity(image_batch, 'input')
-        labels_batch = tf.identity(labels_batch, 'label_batch')
+            image_batch, labels_batch = tf.train.batch_join(
+                images_and_labels, batch_size=batch_size_placeholder, 
+                shapes=[(args.image_size, args.image_size, 3), ()], enqueue_many=True,
+                capacity=4 * nrof_preprocess_threads * args.batch_size,
+                allow_smaller_final_batch=True)
+            image_batch = tf.identity(image_batch, 'image_batch')
+            image_batch = tf.identity(image_batch, 'input')
+            labels_batch = tf.identity(labels_batch, 'label_batch')
 
-        # Build the inference graph
-        prelogits, _ = network.inference(image_batch, args.keep_probability, 
-            phase_train=phase_train_placeholder, bottleneck_layer_size=args.embedding_size,
-            weight_decay=args.weight_decay)
-        
-        embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
-        # Split embeddings into anchor, positive and negative and calculate triplet loss
-        anchor, positive, negative = tf.unstack(tf.reshape(embeddings, [-1,3,args.embedding_size]), 3, 1)
-        triplet_loss = facenet.triplet_loss(anchor, positive, negative, args.alpha)
-        
-        learning_rate = tf.train.exponential_decay(learning_rate_placeholder, global_step,
-            args.learning_rate_decay_epochs*args.epoch_size, args.learning_rate_decay_factor, staircase=True)
-        tf.summary.scalar('learning_rate', learning_rate)
+            # Build the inference graph
+            prelogits, _ = network.inference(image_batch, args.keep_probability, 
+                phase_train=phase_train_placeholder, bottleneck_layer_size=args.embedding_size,
+                weight_decay=args.weight_decay)
+            
+            embeddings = tf.nn.l2_normalize(prelogits, 1, 1e-10, name='embeddings')
+            # Split embeddings into anchor, positive and negative and calculate triplet loss
+            anchor, positive, negative = tf.unstack(tf.reshape(embeddings, [-1,3,args.embedding_size]), 3, 1)
+            triplet_loss = facenet.triplet_loss(anchor, positive, negative, args.alpha)
+            
+            learning_rate = tf.train.exponential_decay(learning_rate_placeholder, global_step,
+                args.learning_rate_decay_epochs*args.epoch_size, args.learning_rate_decay_factor, staircase=True)
+            tf.summary.scalar('learning_rate', learning_rate)
 
-        # Calculate the total losses
-        regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
-        total_loss = tf.add_n([triplet_loss] + regularization_losses, name='total_loss')
+            # Calculate the total losses
+            regularization_losses = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+            total_loss = tf.add_n([triplet_loss] + regularization_losses, name='total_loss')
 
-        # Build a Graph that trains the model with one batch of examples and updates the model parameters
-        train_op = facenet.train(total_loss, global_step, args.optimizer, 
-            learning_rate, args.moving_average_decay, tf.global_variables())
-        
-        # Create a saver
-        saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=3)
+            # Build a Graph that trains the model with one batch of examples and updates the model parameters
+            train_op = facenet.train(total_loss, global_step, args.optimizer, 
+                learning_rate, args.moving_average_decay, tf.global_variables())
+            
+            # Create a saver
+            saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=3)
 
-        # Build the summary operation based on the TF collection of Summaries.
-        summary_op = tf.summary.merge_all()
+            # Build the summary operation based on the TF collection of Summaries.
+            summary_op = tf.summary.merge_all()
 
-        # Start running operations on the Graph.
-        gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)
-        tpu_address = 'grpc://' + os.environ['COLAB_TPU_ADDR']
-        print ('TPU address is', tpu_address)
-        sess = tf.Session(tpu_address)        
+            # Start running operations on the Graph.
+            gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)
+            tpu_address = 'grpc://' + os.environ['COLAB_TPU_ADDR']
+            print ('TPU address is', tpu_address)
+            sess = tf.Session(tpu_address)        
 
-        #sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))        
+            #sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))        
 
-        # Initialize variables
-        sess.run(tf.global_variables_initializer(), feed_dict={phase_train_placeholder:True})
-        sess.run(tf.local_variables_initializer(), feed_dict={phase_train_placeholder:True})
+            # Initialize variables
+            sess.run(tf.global_variables_initializer(), feed_dict={phase_train_placeholder:True})
+            sess.run(tf.local_variables_initializer(), feed_dict={phase_train_placeholder:True})
 
-        summary_writer = tf.summary.FileWriter(log_dir, sess.graph)
-        coord = tf.train.Coordinator()
-        tf.train.start_queue_runners(coord=coord, sess=sess)
+            summary_writer = tf.summary.FileWriter(log_dir, sess.graph)
+            coord = tf.train.Coordinator()
+            tf.train.start_queue_runners(coord=coord, sess=sess)
 
-        with sess.as_default():
+            with sess.as_default():
 
-            if args.pretrained_model:
-                print('Restoring pretrained model: %s' % args.pretrained_model)
-                saver.restore(sess, os.path.expanduser(args.pretrained_model))
+                if args.pretrained_model:
+                    print('Restoring pretrained model: %s' % args.pretrained_model)
+                    saver.restore(sess, os.path.expanduser(args.pretrained_model))
 
-            # Training and validation loop
-            epoch = 0
-            while epoch < args.max_nrof_epochs:
-                step = sess.run(global_step, feed_dict=None)
-                epoch = step // args.epoch_size
-                # Train for one epoch
-                train(args, sess, train_set, epoch, image_paths_placeholder, labels_placeholder, labels_batch,
-                    batch_size_placeholder, learning_rate_placeholder, phase_train_placeholder, enqueue_op, input_queue, global_step, 
-                    embeddings, total_loss, train_op, summary_op, summary_writer, args.learning_rate_schedule_file,
-                    args.embedding_size, anchor, positive, negative, triplet_loss)
+                # Training and validation loop
+                epoch = 0
+                while epoch < args.max_nrof_epochs:
+                    step = sess.run(global_step, feed_dict=None)
+                    epoch = step // args.epoch_size
+                    # Train for one epoch
+                    train(args, sess, train_set, epoch, image_paths_placeholder, labels_placeholder, labels_batch,
+                        batch_size_placeholder, learning_rate_placeholder, phase_train_placeholder, enqueue_op, input_queue, global_step, 
+                        embeddings, total_loss, train_op, summary_op, summary_writer, args.learning_rate_schedule_file,
+                        args.embedding_size, anchor, positive, negative, triplet_loss)
 
-                # Save variables and the metagraph if it doesn't exist already
-                save_variables_and_metagraph(sess, saver, summary_writer, model_dir, subdir, step)
+                    # Save variables and the metagraph if it doesn't exist already
+                    save_variables_and_metagraph(sess, saver, summary_writer, model_dir, subdir, step)
 
-                # Evaluate on LFW
-                if args.lfw_dir:
-                    evaluate(sess, lfw_paths, embeddings, labels_batch, image_paths_placeholder, labels_placeholder, 
-                            batch_size_placeholder, learning_rate_placeholder, phase_train_placeholder, enqueue_op, actual_issame, args.batch_size, 
-                            args.lfw_nrof_folds, log_dir, step, summary_writer, args.embedding_size)
+                    # Evaluate on LFW
+                    if args.lfw_dir:
+                        evaluate(sess, lfw_paths, embeddings, labels_batch, image_paths_placeholder, labels_placeholder, 
+                                batch_size_placeholder, learning_rate_placeholder, phase_train_placeholder, enqueue_op, actual_issame, args.batch_size, 
+                                args.lfw_nrof_folds, log_dir, step, summary_writer, args.embedding_size)
 
     return model_dir
 
