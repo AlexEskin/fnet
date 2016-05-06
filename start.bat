@@ -1,0 +1,1 @@
+python src/train_tripletloss.py --logs_base_dir logs/facenet/ --models_base_dir models/facenet/ --data_dir datasets/examples --image_size 160 --model_def models.inception_resnet_v1 --optimizer RMSPROP --learning_rate 0.01 --weight_decay 1e-4 --max_nrof_epochs 500
