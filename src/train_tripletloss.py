@@ -162,7 +162,7 @@ def main(args):
             summary_op = tf.summary.merge_all()
 
             # Start running operations on the Graph.
-            gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)
+            #gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)
             tpu_address = 'grpc://' + os.environ['COLAB_TPU_ADDR']
             print ('TPU address is', tpu_address)
             sess = tf.Session(tpu_address)        
