@@ -158,7 +158,11 @@ def main(args):
 
         # Start running operations on the Graph.
         gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=args.gpu_memory_fraction)
-        sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))        
+        tpu_address = 'grpc://' + os.environ['COLAB_TPU_ADDR']
+        print ('TPU address is', tpu_address)
+        sess = tf.Session(tpu_address)        
+
+        #sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))        
 
         # Initialize variables
         sess.run(tf.global_variables_initializer(), feed_dict={phase_train_placeholder:True})
@@ -323,7 +327,12 @@ def sample_people(dataset, people_per_batch, images_per_person):
     num_per_class = []
     sampled_class_indices = []
     # Sample images from these classes until we have enough
-    while len(image_paths)<nrof_images and i<len(class_indices):
+    print("=======================================================")
+    print(class_indices)
+    print(nrof_images)
+    print(len(class_indices))
+    while len(image_paths)<nrof_images:
+        print(i, len(image_paths))
         class_index = class_indices[i]
         nrof_images_in_class = len(dataset[class_index])
         image_indices = np.arange(nrof_images_in_class)
